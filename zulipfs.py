@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, errno, stat, sys, fuse, time, zulip
+import os, emoji, errno, stat, sys, fuse, time, zulip
 from datetime import datetime
 
 fuse.fuse_python_api = (0, 2)
@@ -10,87 +10,99 @@ class ZulipFS(fuse.Fuse):
     def __init__(self):
         fuse.Fuse.__init__(self)
         self.client = zulip.Client(config_file="~/.zuliprc")
-        self.channels = { self.normalize(i['name']): i for i in self.client.get_streams()['streams'] }
-        self.topics = {}
+        self.channels = { self.file_name(i['name']): i for i in self.client.get_streams()['streams'] }
+        self.topics = {i: {} for i in self.channels.keys()}
 
-    def normalize(self, name):
-        return name.replace('/', '%2F')
+    def file_name(self, name):
+        return emoji.demojize(name.replace('/', '%2F'))
 
-    def get_topics(self, channel):
-        if channel not in self.topics:
-            # setting the limit of topics to 50
-            topicslist = self.client.get_stream_topics(self.channels[channel]['stream_id'])['topics'][:50]
-            self.topics[channel] = { self.normalize(t['name']): t for t in topicslist }
-        return self.topics[channel]
+    def zulip_name(self, name):
+        return emoji.emojize(name.replace('%2F', '/'))
 
-    def readdir(self, path: str, offset: int):
-        contents = [ '.', '..' ]
+    def get_topic(self, channel, topic):
+        request = {
+            "anchor": "newest",
+            "num_before": 1,
+            "num_after": 0,
+            "narrow": [
+                {"operator": "channel", "operand": self.channels[channel]['name']},
+                {"operator": "topic", "operand": self.zulip_name(topic)},
+            ],
+            "apply_markdown": False,
+        }
+        try:
+            message = self.client.get_messages(request)['messages'][0]
+
+            timestamp = float(message['timestamp'])
+            message_fmt = f"""[{datetime.fromtimestamp(message['timestamp'])}] {message['sender_full_name']}
+{message['content']}
+""".encode()
+
+            if topic not in self.topics[channel]:
+                # First message in file
+                self.topics[channel][topic] = {
+                    'last_message': message_fmt,
+                    'last_timestamp': timestamp,
+                }
+            else:
+                # Subsequent messages appended to file
+                if timestamp > self.topics[channel][topic]['last_timestamp']:
+                    self.topics[channel][topic] = {
+                        'last_message': self.topics[channel][topic]['last_message'] + b"\n" + message_fmt,
+                        'last_timestamp': timestamp,
+                    }
+
+        except IndexError:
+            # topic doesn't exist
+            pass
+
+        return self.topics[channel][topic]
+
+    def readdir(self, path, offset):
+        dirents = [ '.', '..' ]
         if path == '/':
-            contents.extend(self.channels.keys())
+            dirents.extend(self.channels.keys())
         else:
-            channel = path[1:]
-            if channel in self.channels:
-                self.get_topics(channel)
-                contents.extend(self.topics[channel].keys())
+            dirents.extend(self.topics[path[1:]].keys())
 
-        for r in contents:
+        for r in dirents:
             yield fuse.Direntry(r)
 
-    def getattr(self, path: str) -> fuse.Stat:
+    def getattr(self, path):
         st = fuse.Stat()
-        now = time.time()
-
-        dirs = [ '/%s' % i for i in self.channels.keys() ]
-        dirs.extend('/')
-
-        if path in dirs:
-            st.st_mode = stat.S_IFDIR | 0o555
+        if path == "/" or path[1:] in self.channels.keys():
+            # channel/directory
+            st.st_mode = stat.S_IFDIR | 0o755
             st.st_nlink = 2
-            st.st_atime = now
-            st.st_atime = now
-            st.st_atime = now
-            return st
+            st.st_size = 4096
+            st.st_mtime = time.time()
+        else:
+            # topic/file
+            try:
+                channel, topic = path[1:].split('/')
+                t = self.get_topic(channel, topic)
+                st.st_mode = stat.S_IFREG | 0o644
+                st.st_nlink = 1
+                st.st_size = len(t['last_message'])
+                st.st_mtime = t['last_timestamp']
+            except ValueError:
+                return -errno.ENOENT
 
-        channel, topic = path[1:].split('/')
+        st.st_atime = st.st_mtime
+        st.st_ctime = st.st_mtime
+        st.st_uid = os.getuid()
+        st.st_gid = os.getgid()
+        return st
+
+    def read(self, path, size, offset):
         try:
-            try:
-                timestamp = self.topics[channel][topic]['last_timestamp']
-            except KeyError:
-                timestamp = now
-
-            st.st_mode = stat.S_IFREG | 0o666
-            st.st_nlink = 1
-
-            try:
-                st.st_size = len(self.topics[channel][topic]['last_message']) + 1
-            except KeyError:
-                st.st_size = 65535
-
-            st.st_atime = timestamp
-            st.st_mtime = timestamp
-            st.st_ctime = timestamp
-            return st
+            channel, topic = path[1:].split('/')
+            t = self.get_topic(channel, topic)
+            return t['last_message']
         except ValueError:
             return -errno.ENOENT
 
-        return -errno.ENOENT
-
-    def read(self, path: str, size: int, offset: int) -> bytes:
-        channel, topic = path[1:].split('/')
-        try:
-            self.get_topics(channel)
-
-            last_message = self.client.get_raw_message(self.topics[channel][topic]['max_id'])
-            self.topics[channel][topic]['last_message'] = f"""[{datetime.fromtimestamp(last_message['message']['timestamp'])}] {last_message['message']['sender_full_name']}
-{last_message['raw_content']}
-"""
-            self.topics[channel][topic]['last_timestamp'] = float(last_message['message']['timestamp'])
-
-            return self.topics[channel][topic]['last_message'].encode()
-        except ValueError:
-            return -errno.ENOENT
-
-    def write(self, path: str, body: bytes, offset: int):
+    def write(self, path, body, offset):
         channel, topic = path[1:].split('/')
         request = {
             "type": "stream",
