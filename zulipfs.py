@@ -55,7 +55,9 @@ class ZulipFS(fuse.Fuse):
         except IndexError:
             # channel or topic doesn't exist
             pass
-
+        
+        # if a channel or topic doesn't exist, this statement will cause an 
+        # exception in the function where this is called.
         return self.topics[channel][topic]
 
     def readdir(self, path, offset):
