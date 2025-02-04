@@ -7,11 +7,11 @@ fuse.fuse_python_api = (0, 2)
 
 class ZulipFS(fuse.Fuse):
 
-    def __init__(self):
-        fuse.Fuse.__init__(self)
-        self.client = zulip.Client(config_file="~/.zuliprc")
+    def __init__(self, *args, **kw):
+        fuse.Fuse.__init__(self, *args, **kw)
+        self.client = zulip.Client(config_file="~/zuliprc.txt")
         self.channels = { self.file_name(i['name']): i for i in self.client.get_streams()['streams'] }
-        self.topics = {i: {} for i in self.channels.keys()}
+        self.topics = {i: {} for i in self.channels }
 
     def file_name(self, name):
         return emoji.demojize(name.replace('/', '%2F'))
@@ -39,13 +39,13 @@ class ZulipFS(fuse.Fuse):
 """.encode()
 
             if topic not in self.topics[channel]:
-                # First message in file
+                # first message in file
                 self.topics[channel][topic] = {
                     'last_message': message_fmt,
                     'last_timestamp': timestamp,
                 }
             else:
-                # Subsequent messages appended to file
+                # subsequent messages appended to file
                 if timestamp > self.topics[channel][topic]['last_timestamp']:
                     self.topics[channel][topic] = {
                         'last_message': self.topics[channel][topic]['last_message'] + b"\n" + message_fmt,
@@ -53,7 +53,7 @@ class ZulipFS(fuse.Fuse):
                     }
 
         except IndexError:
-            # topic doesn't exist
+            # channel or topic doesn't exist
             pass
 
         return self.topics[channel][topic]
@@ -63,14 +63,14 @@ class ZulipFS(fuse.Fuse):
         if path == '/':
             dirents.extend(self.channels.keys())
         else:
-            dirents.extend(self.topics[path[1:]].keys())
+            dirents.extend([ i for i in self.topics[path[1:]].keys() ])
 
         for r in dirents:
             yield fuse.Direntry(r)
 
     def getattr(self, path):
         st = fuse.Stat()
-        if path == "/" or path[1:] in self.channels.keys():
+        if path == "/" or path[1:] in self.channels:
             # channel/directory
             st.st_mode = stat.S_IFDIR | 0o755
             st.st_nlink = 2
@@ -85,7 +85,7 @@ class ZulipFS(fuse.Fuse):
                 st.st_nlink = 1
                 st.st_size = len(t['last_message'])
                 st.st_mtime = t['last_timestamp']
-            except ValueError:
+            except (KeyError, ValueError):
                 return -errno.ENOENT
 
         st.st_atime = st.st_mtime
@@ -99,21 +99,25 @@ class ZulipFS(fuse.Fuse):
             channel, topic = path[1:].split('/')
             t = self.get_topic(channel, topic)
             return t['last_message']
-        except ValueError:
+        except (KeyError, ValueError):
             return -errno.ENOENT
+        return -errno.ENOENT
 
-    def write(self, path, body, offset):
-        channel, topic = path[1:].split('/')
-        request = {
-            "type": "stream",
-            "to": channel,
-            "topic": topic,
-            "content": body.decode(),
-        }
-        self.client.send_message(request)
-        return len(body)
+    def write(self, path, buf, offset):
+        try:
+            channel, topic = path[1:].split('/')
+            request = {
+                "type": "stream",
+                "to": self.zulip_name(channel),
+                "topic": self.zulip_name(topic),
+                "content": buf.decode(),
+            }
+            self.client.send_message(request)
+        except (KeyError, ValueError):
+            return -errno.ENOENT
+        return len(buf)
 
 if __name__ == '__main__':
-    server = ZulipFS()
+    server = ZulipFS(dash_s_do='setsingle')
     server.parse(errex=1)
     server.main()
